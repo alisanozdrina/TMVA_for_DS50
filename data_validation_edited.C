@@ -53,7 +53,7 @@
 #define S1_MAX 460.
 
 // Open output file
-TString outfile_name = "results_example.root";
+TString outfile_name = "results_uar_example.root";
 TFile* outfile = new TFile(outfile_name, "RECREATE");
 
 Bool_t load_allpulses = true;
@@ -111,7 +111,6 @@ struct TPCEvent {
   Float_t total_s1_top;
   Float_t total_s1_bottom;
   Float_t total_s1_long_us_integrals[170];
-  Float_t total_s2_long_us_integrals[170]; 
   //s1_saturation
   Int_t s1_saturated;
   //s1_time
@@ -194,11 +193,8 @@ struct TPCEvent {
   Int_t veto_present;
   Float_t veto_lsv_total_charge;
   Float_t veto_wt_total_charge;
-  Int_t	veto_nclusters; 
   std::vector<float>* veto_roi_lsv_charge_vec;
   std::vector<float>* veto_slider_lsv_charge_vec;
-  std::vector<float>* veto_cluster_dtprompt_vec;
-  std::vector<float>* veto_cluster_charge_vec;
 
   // Variables to be calculated on the fly
   Float_t s1_prompt;
@@ -227,6 +223,151 @@ struct TPCEvent {
 // Set the branch address for the variables in TPCEvent.
 // To increase speed, we disable all branches by default, and turn on only the
 // ones we want to use.
+Double_t tanh_func(Double_t* x, Double_t* p){
+  return p[0]+p[1]*(TMath::TanH(p[2]*(x[0]-p[3])));
+}
+
+
+//This fitting function is copied from G. Koh
+TF1* tanhFitter(TH1F* hTdrift, double eField){
+  
+  double tanhFitMin(0.), tanhFitMax(0.);
+  if(eField==200){
+    tanhFitMin = 373.; tanhFitMax = 379;
+  }
+  else if(eField==100){
+    tanhFitMin = 650.; tanhFitMax = 670.;
+  }
+  else if(eField==50){
+    tanhFitMin = 1200.; tanhFitMax = 1300.;
+  }
+  
+  TF1* tanh_fit = new TF1("tanh_fit", tanh_func, tanhFitMin, tanhFitMax, 4);
+  tanh_fit->SetLineColor(kRed);
+  tanh_fit->SetNpx(1000);
+  
+  double par0_est = 0.5 * hTdrift->GetBinContent( hTdrift->GetXaxis()->FindBin(tanhFitMin) );
+  double par1_est = -par0_est;
+  tanh_fit->SetParameter(0, par0_est);
+  tanh_fit->SetParameter(1, par1_est);
+  tanh_fit->SetParameter(2, 1);
+  tanh_fit->SetParameter(3, (tanhFitMax+tanhFitMin)/2.+0.5);
+  
+  hTdrift->Fit("tanh_fit", "EMR", "", tanhFitMin, tanhFitMax);
+  
+  return tanh_fit;
+  
+}
+
+void maxdrift(TString mainfile) {
+
+TFile* fin = new TFile(mainfile, "OPEN");
+  TTree* t= (TTree*) fin->Get("events"); //tree name
+
+ifstream runlist("runlist.txt");
+std::vector<int> run_vec;
+  std::string input = "";
+  if (runlist.is_open()) {
+    while (runlist >> input) {
+      run_vec.push_back(atoi(input.c_str()));
+    }
+    runlist.close();
+  }
+
+std::cout<<"number of points"<<run_vec.size()<<"\n";
+std::sort(run_vec.begin(), run_vec.end());
+
+ int nr=20;
+  std::vector<int> first_run, last_run;
+  int n_run= run_vec.size();
+  for (int i=0;  i<n_run; i++ ){
+    if (i%nr==0) {
+      first_run.push_back(run_vec.at(i));
+      if (i+nr>=n_run) {
+        last_run.push_back(run_vec.at(n_run-1));
+        break;
+      }
+      else last_run.push_back(run_vec.at(i+nr-1));
+    }
+  }
+
+//Draw zoomed tdrift spectum
+  int ngroup = first_run.size();
+  std::vector<string> hstr_vec;
+  TH1F* h[ngroup];   int hmin=370; int hmax=385; int nbin=160;
+  for (int i=0; i<ngroup; i++) {
+	std::cout<<"number of current group"<< i <<"\n";
+    hstr_vec.push_back( "hist"+std::to_string(i) );
+    std::string namestr = "run "+std::to_string(first_run.at(i))+" to "+std::to_string(last_run.at(i));
+    h[i] = new TH1F(hstr_vec.at(i).c_str(), namestr.c_str(), nbin, hmin, hmax);
+    
+    std::string plotstr = "tdrift>>"+hstr_vec.at(i);
+    std::string cutstr = "nchannel==38 && !SumChannelHasNoBaseline && n_phys_pulses==2 && !has_s3 && total_s2_f90 && s1_start_time>=-6.10 && s1_start_time<=-6.00 && total_s2_f90<0.2 && total_s2/total_s1>0.01";
+    std::string allcutstr = cutstr+ " && run_id>="+std::to_string(first_run.at(i))+" && run_id<="+std::to_string(last_run.at(i));
+    t->Draw(plotstr.c_str(), allcutstr.c_str(), "");
+  }
+  
+  
+  //Fit the edge
+  TF1* func[ngroup];
+  for (int i=0; i<ngroup; i++) {
+    func[i] = tanhFitter(h[i], 200);
+  }
+
+//save histogram to output root
+   string histo_str = string("MaxDrift.root");
+  TFile *fout = new TFile (histo_str.c_str(),"RECREATE");
+  fout->cd();
+  TCanvas* c[ngroup];
+  for (int i=0; i<ngroup; i++) {
+    h[i]->Write();
+    
+    string str = "c"+to_string(i);
+    c[i] = new TCanvas(str.c_str(), str.c_str(), 1);
+    c[i]->cd(); h[i]->Draw("e"); func[i]->Draw("same");
+  }
+ Double_t run[ngroup], md[ngroup], md_e[ngroup], chi2[ngroup];
+  for (int i=0; i<ngroup; i++) {
+    run[i] = (Double_t) first_run[i];
+    md[i] = func[i]->GetParameter(3);
+    md_e[i] = func[i]->GetParError(3);
+    chi2[i] = func[i]->GetChisquare()/func[i]->GetNDF();
+//    chi2[i] = func[i]->GetChisquare();
+
+  }
+
+  //Draw tdrift max trend
+  TCanvas* c_md = new TCanvas("c_md", "c_md", 1);
+  c_md->SetGrid();
+  Double_t* xe;
+  TGraphErrors* gr = new TGraphErrors(ngroup, run, md, xe=0, md_e);
+  gr->SetTitle("Max Drift time Trend (Tanh center)");
+  gr->GetXaxis()->SetTitle("run");
+  gr->GetYaxis()->SetTitle("Max Drift time [us]");
+  gr->SetMarkerColor(4);
+  gr->SetMarkerStyle(21);
+  gr->SetMaximum(378);
+  gr->SetMinimum(375);
+  gr->Draw("AP");
+  c_md->Print((string("maxdrift.pdf")).c_str());
+  
+  //Draw Chi2 trend
+  TCanvas* c_chi2 = new TCanvas("c_chi2", "c_chi2", 1);
+  c_chi2->SetGrid();
+  Double_t* ye;
+  TGraphErrors* gr2 = new TGraphErrors(ngroup, run, chi2, xe=0, ye=0);
+  gr2->SetTitle("Goodness of fit - maxdrift");
+  gr2->GetXaxis()->SetTitle("run");
+  gr2->GetYaxis()->SetTitle("Chi Square");
+  gr2->SetMarkerColor(4);
+  gr2->SetMarkerStyle(21);
+  gr2->SetMaximum(3);
+  gr2->SetMinimum(0);
+  gr2->Draw("AP");
+  c_chi2->Print((string("maxdrift_chi2.pdf")).c_str());
+  
+
+}
 
 void load_tpctree(TChain* tpc_events, TPCEvent& e) {
   tpc_events->SetBranchStatus("*",0); //disable all
@@ -300,7 +441,7 @@ void load_tpctree(TChain* tpc_events, TPCEvent& e) {
   tpc_events->SetBranchAddress("s1.total_s1_bottom", &e.total_s1_bottom);
 
   tpc_events->SetBranchStatus("s1.total_s1_long_us_integrals", 1);
-  tpc_events->SetBranchAddress("s1.total_s1_long_us_integrals", &e.total_s1_long_us_integrals);
+  tpc_events->SetBranchAddress("s1.total_s1_long_us_integrals", e.total_s1_long_us_integrals);
   
   // s1_saturation
   tpc_events->SetBranchStatus("s1_saturation.is_saturated_pulse0", 1);
@@ -334,15 +475,10 @@ void load_tpctree(TChain* tpc_events, TPCEvent& e) {
   // s2
   tpc_events->SetBranchStatus("s2.total_s2", 1);
   tpc_events->SetBranchAddress("s2.total_s2", &e.total_s2);
-  
-  tpc_events->SetBranchStatus("s2.total_s2_long_us_integrals", 1);
-  tpc_events->SetBranchAddress("s2.total_s2_long_us_integrals", &e.total_s2_long_us_integrals);
-
 
   // s2_saturation
   tpc_events->SetBranchStatus("s2_saturation.is_saturated_pulse1", 1);
   tpc_events->SetBranchAddress("s2_saturation.is_saturated_pulse1", &e.s2_saturated);
-
 
   // s2_f90
   tpc_events->SetBranchStatus("s2_f90.total_s2_f90", 1);
@@ -515,10 +651,7 @@ void load_tpctree(TChain* tpc_events, TPCEvent& e) {
     // SLAD RunXXXXXX_veto.root
     tpc_events->SetBranchStatus("veto_run_id", 1);
     tpc_events->SetBranchAddress("veto_run_id", &e.veto_run_id);
-
-    tpc_events->SetBranchStatus("veto_nclusters", 1);
-    tpc_events->SetBranchAddress("veto_nclusters", &e.veto_nclusters);    
-
+    
     tpc_events->SetBranchStatus("veto_event_id", 1);
     tpc_events->SetBranchAddress("veto_event_id", &e.veto_event_id);
     
@@ -552,22 +685,13 @@ void load_tpctree(TChain* tpc_events, TPCEvent& e) {
     */
   
     e.veto_roi_lsv_charge_vec = 0;
-   e.veto_slider_lsv_charge_vec = 0;
-    e.veto_cluster_dtprompt_vec = 0;
-    e.veto_cluster_charge_vec = 0;
+    e.veto_slider_lsv_charge_vec = 0;
   
     tpc_events->SetBranchStatus("veto_roi_lsv_charge_vec", 1);
     tpc_events->SetBranchAddress("veto_roi_lsv_charge_vec", &e.veto_roi_lsv_charge_vec);
   
     tpc_events->SetBranchStatus("veto_slider_lsv_charge_vec", 1);
     tpc_events->SetBranchAddress("veto_slider_lsv_charge_vec", &e.veto_slider_lsv_charge_vec);
-
-	
-    tpc_events->SetBranchStatus("veto_cluster_dtprompt_vec", 1);
-    tpc_events->SetBranchAddress("veto_cluster_dtprompt_vec", &e.veto_cluster_dtprompt_vec);
-  
-    tpc_events->SetBranchStatus("veto_cluster_charge_vec", 1);
-    tpc_events->SetBranchAddress("veto_cluster_charge_vec", &e.veto_cluster_charge_vec);
   }
 } //load_tpctree
 
@@ -699,11 +823,8 @@ void event_loop(TChain* tpc_events, TString type = "") {
   Bool_t aar  = (type == "aar");
   Bool_t uar  = (type == "uar");
   Bool_t ambe = (type == "ambe" || type == "ambebg");
-	Float_t new_v;
-  TTree *t2 = new TTree("t2","data from histogram");  
-  t2->Branch("point",&new_v,"s1 form");
-
-// Load max_s1_frac threshold file so can apply other versions of S1 max frac cut on the fly.
+  
+  // Load max_s1_frac threshold file so can apply other versions of S1 max frac cut on the fly.
   TFile* s1mf_file = new TFile("max_frac_cut_fixed_acceptance_full_stats.root");
   if(s1mf_file->IsZombie() || !s1mf_file) std::cout << "Bad S1mf_file" << std::endl;
   TH2F* h_s1mf_thresholds = (TH2F*) s1mf_file->Get("s1pmf_c95"); // Load 95%ile cut.
@@ -719,6 +840,20 @@ void event_loop(TChain* tpc_events, TString type = "") {
   outfile->cd(type);
   
   // EventCounter
+
+//Data_validation directory
+TDirectory* data_validation_dir = gDirectory->mkdir("data_validation");
+data_validation_dir->cd();
+
+ // define histogram
+maxdrift();
+//TGraphErrors* tdrift_trend = new TGraphErrors(ngroup, run, md, xe=0, md_e);
+//TGraphErrors* tdrift_chi2 = new TGraphErrors(ngroup, run, chi2, xe=0, ye=0);
+
+
+
+outfile->cd(type);
+// Metadata
   TDirectory* metadata_dir = gDirectory->mkdir("metadata");
   metadata_dir->cd();
   const TString CutLabels[nCuts] = {
@@ -751,9 +886,7 @@ void event_loop(TChain* tpc_events, TString type = "") {
   TH1F* h_tdrift_badxy = new TH1F("h_tdrift_badxy", "; t_{drift} [#mus]", 200, 0., 400.);
   TH1F* h_S2f90        = new TH1F("h_S2f90",        "; S2_f90", 1000, 0., 1.);
   TH1F* h_rdiff        = new TH1F("h_rdiff",        "; #Deltar [cm]", 400, -20., 20.);
-  Double_t norm = 1;
-  TH1F* h_s1_waveform  = new TH1F("h_s1_form",      ";s1 long integrals, ", 500, 0., 9000000.);
-  TH1F* h_s2_waveform  = new TH1F("h_s2_form",      ";s2 long integrals, ", 500, 0., 9000000.);
+  
   outfile->cd(type);
 
   // DMS
@@ -775,7 +908,6 @@ void event_loop(TChain* tpc_events, TString type = "") {
     h_DMS[ihdms]->GetXaxis()->SetTitle("S1 [PE]");
     h_DMS[ihdms]->GetYaxis()->SetTitle("f_{90}");
   }
-
 
   // S1 vs. tdrift
   outfile->cd(type);
@@ -834,16 +966,7 @@ void event_loop(TChain* tpc_events, TString type = "") {
 
     if (e.tpc_run_id < 12638) livetime_before_12638 += e.live_time;
     else livetime_after_12638 += e.live_time;
-//	cout << "n event=" << n << endl;
-//	cout << "vector size " << e.veto_cluster_dtprompt_vec->size() << endl;
-//	cout <<  "e.veto_cluster_charge_vec->at(0)" << e.veto_cluster_charge_vec->at(0) << endl;
-//	for (unsigned i=0; i<e.veto_cluster_dtprompt_vec->size(); i++){
-//	if (e.veto_cluster_dtprompt_vec->at(i)>-0.05 && e.veto_cluster_dtprompt_vec->at(i)<-0.04)
- // 	cout << e.veto_cluster_dtprompt_vec->at(i) << endl;
-//	}
-
-	//if (e.veto_cluster_dtprompt_vec->at(0) > -0.05 && e.veto_cluster_dtprompt_vec->at(0) < -0.04 && e.veto_cluster_charge_vec->at(0) > 2400 && e.veto_cluster_charge_vec->at(0) < 3800){	
-
+    
     // Calculate some variables on the fly
     e.s1_prompt       = e.total_f90 * e.total_s1;
     e.s1_late         = e.total_s1 - e.s1_prompt;
@@ -930,22 +1053,11 @@ void event_loop(TChain* tpc_events, TString type = "") {
     Float_t s2               = e.total_s2 * e.xycorr_factor;
     Float_t log10s2overs1    = (s2>0 ? TMath::Log10(s2/s1) : -999);
     
-	 
-	    // Keep track of time since last muon
-	    if (!CX_veto_muon) e.muon_dt = 0.;
-    else               e.muon_dt += (e.live_time + e.inhibit_time); // BUG FIX (G.Koh): used to be live + acqui.
-	if (e.tdrift > 40. && e.tdrift < 336.){
-//	 unsigned i=0;
-  //      if (e.veto_cluster_charge_vec->at(i)>2400 && e.veto_cluster_charge_vec->at(i)<3600){
 
-	
-//	for (unsigned i=0; i<e.veto_cluster_dtprompt_vec->size(); i++){
-//      if (e.veto_cluster_dtprompt_vec->at(i)>-0.05 && e.veto_cluster_dtprompt_vec->at(i)<-0.04){
-     //cout << e.veto_cluster_dtprompt_vec->at(i) << endl;
-// 	 for (unsigned j=0; j<e.veto_cluster_charge_vec->size(); j++){
-//      if (e.veto_cluster_charge_vec->at(j)>2400 && e.veto_cluster_charge_vec->at(j)<3600){
-    
- 
+    // Keep track of time since last muon
+    if (!CX_veto_muon) e.muon_dt = 0.;
+    else               e.muon_dt += (e.live_time + e.inhibit_time); // BUG FIX (G.Koh): used to be live + acqui.
+
     // filling histos
     // h_EventCounter
     h_EventCounter->Fill(NOCUTS);
@@ -993,6 +1105,7 @@ void event_loop(TChain* tpc_events, TString type = "") {
     if (CX_quality && CX_veto && CX_single_scatter && CX_trg_time
         && CX_s1_sat && CX_s1_mf && CX_s2_f90 && CX_s2_size /*&& CX_fiducial*/
         && CX_s1_range)                                                      h_tdrift      ->Fill(e.tdrift);
+									     
     if (CX_quality && CX_veto && CX_single_scatter && CX_trg_time
         && CX_s1_sat && CX_s1_mf && CX_s2_f90 && CX_s2_size /*&& CX_fiducial*/
         && CX_s1_range && s1<200.)                                            h_tdrift_lowS1->Fill(e.tdrift);
@@ -1041,13 +1154,6 @@ void event_loop(TChain* tpc_events, TString type = "") {
     if (CX_quality/*&& CX_veto*/&& CX_single_scatter
         && CX_trg_time && CX_s1_sat && CX_s1_mf && CX_s2_f90 && CX_s2_size
         /*&& CX_s1_range*/ && CX_fiducial)                                   h_DMS[0]->Fill(s1,f90);
-									     
-	for (int h=0; h<170; h++ ){	
-	new_v = e.total_s1_long_us_integrals[h];
-	t2->Fill();	
-	h_s1_waveform->Fill(e.total_s1_long_us_integrals[h]);
-	h_s2_waveform->Fill(e.total_s2_long_us_integrals[h]);}
-
     if (CX_quality && CX_veto && CX_single_scatter
         && CX_trg_time && CX_s1_sat && CX_s1_mf && CX_s2_f90 && CX_s2_size
         /*&& CX_s1_range*/ && CX_fiducial)                                   h_DMS[1]->Fill(s1,f90);
@@ -1067,7 +1173,7 @@ void event_loop(TChain* tpc_events, TString type = "") {
     if (CX_quality && CX_veto_cosmogenic && CX_single_scatter
         && CX_trg_time && CX_s1_sat && CX_s1_mf && CX_s2_f90 && CX_s2_size
         /*&& CX_s1_range*/ && CX_fiducial)                                   h_DMS[6]->Fill(s1,f90);
-    if (CX_quality /*&& CX_veto*/ /*&& CX_single_scatter*/
+    if (CX_quality /*&& CX_veto*/ && CX_single_scatter
         && CX_trg_time && CX_s1_sat/*&& CX_s1_mf*/&& CX_s2_f90 && CX_s2_size
         /*&& CX_s1_range*/ && CX_fiducial)                                   h_DMS[7]->Fill(s1,f90);
     if (CX_quality && CX_veto && CX_single_scatter
@@ -1097,15 +1203,13 @@ void event_loop(TChain* tpc_events, TString type = "") {
     if (CX_quality && CX_veto && CX_single_scatter
         && CX_trg_time && CX_s1_sat && CX_s1_mf && CX_s2_f90 && CX_s2_size
         /*&& CX_s1_range*/ && CX_fiducial && CX_r10 && CX_f90_s2s1_s1range) h_f90_s2s1[2]->Fill(f90,log10s2overs1);
-}
+
   }//loop over events
-//}}}}
+
   cout << "Livetime before 12638: "<< livetime_before_12638<<endl;
   cout << "Livetime after 12638: "<<livetime_after_12638<<endl;
-//h_s1_waveform->Scale(norm, "width");
-h_s2_waveform->Scale(norm, "width");
- t2->Write("", TObject::kOverwrite);  
-// Normalize histograms again by mass
+
+  // Normalize histograms again by mass
   const Float_t full_mass = TMath::Pi() * TPC_RMAX * TPC_RMAX * (FULL_VOL_TDRIFT_MAX - FULL_VOL_TDRIFT_MIN) * VDRIFT / 10. * LAR_DENSITY / 1000.;
   const Float_t core_mass = TMath::Pi() * CORE_R_MAX * CORE_R_MAX * (CORE_TDRIFT_MAX - CORE_TDRIFT_MIN) * VDRIFT / 10. * LAR_DENSITY / 1000.;
 
@@ -1188,6 +1292,8 @@ TChain* load_files(TString mainfile)
 }
 
 
+
+
 //------------------------------------------------------------------------------
 // Main method. Load DST files and invoke event_loop().
 void data_validation() {
@@ -1203,17 +1309,20 @@ void data_validation() {
 
   Bool_t doUAr     = 1;
   
+  
   if (doUAr) {
     load_allpulses = true;
     load_masas_xy = true;
     load_xylocator_xy = true;
-    load_veto = false;
+    load_veto = true;
     
     // The main SLAD file containing the data we want.
-//     TString mainfile = "/nashome/n/nozdrina/scratch/AmBe/nps/AmBe_160nps_SLAD_v3_3_0_merged.root";
-    TString mainfile = "/home/nozdrina/DS50_analisys/neural/UAr_70d_SLAD_v2_3_3.root";
+    TString mainfile = "UAr_70d_SLAD_v2_3_3.root";
     TChain* tpc_events = load_files(mainfile);
-    event_loop(tpc_events, "ambe");
+	
+    event_loop(tpc_events, "uar");
+	
+	 maxdrift();
   }
 
   
